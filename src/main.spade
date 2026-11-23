@@ -1,0 +1,808 @@
+use ready_valid::Rv;
+use std::conv::concat_arrays;
+
+pub struct Output {
+    scl_low: bool,
+    sda_low: bool,
+
+    status: Option<status>,
+}
+
+pub struct Config<#uint N> {
+    // The fields are ordered based on the order of phases
+
+    // The minimum start condition hold time, in clock cycles
+    // "hold time (repeated) START condition"
+    start_hold_cycles: uint<N>,
+    // The minimum number of cycles that data should be held after SCL changes to low
+    // "data hold time"
+    data_hold_cycles: uint<N>,
+    // The minimum number of clock cycles between setting SDA to the value and setting SCL high.
+    // "data set-up time"
+    data_setup_cycles: uint<N>,
+    // This might surprise you: one SCL clock technically cannot be 50% high 50% low.
+    // It actually needs to be low for >50% of the min clock duration.
+    // This value is the minimum number of cycles that SCL needs to be held low.
+    scl_low_cycles: uint<N>,
+    // The minimum number of cycles that SCL must be held high
+    scl_high_cycles: uint<N>,
+    // The minimum number of clock cyles for 1 SCL clock cycle
+    // "SCL clock frequency" (converted into period)
+    scl_cycles: uint<N>,
+    // The minimum number of clock cycles that SDA must be held low before it can be set high when sending STOP.
+    // "set-up time for STOP condition"
+    stop_setup_cycles: uint<N>,
+    // The minimum number of clock cycles between finishing sending STOP and starting sending START
+    after_stop_cycles: uint<N>,
+    // The min # of cycles that SDA must be held high before making SDA low to signal a repeated START
+    restart_setup_cycles: uint<N>,
+
+    // Not configurable currently:
+    // The number of cycles that the target is allowed to wait between SCL going low and pulling SDA low to signal ACK.
+    // In practice this should always be <scl_low_cycles, so the controller can sample SDA at the same time that it sets SCL high.
+    // Maybe there is a device which actually allows itself time >scl_low_cycles, and we need to adjust our logic.
+    // But until such a device is known to exist we will assume sampling at the same time that SCL is set high is okay.
+    // ack_cycles: uint<N>
+}
+
+impl<#uint N> Config<N> {
+    fn data_hold_clocks(self) -> uint<N> {
+        self.data_hold_cycles
+    }
+
+    fn low_for_ack_clocks(self) -> uint<N> {
+        if self.scl_low_cycles >= self.data_hold_cycles {
+            self.scl_low_cycles -. self.data_hold_cycles
+        } else {
+            0
+        }
+    }
+
+    fn high_for_ack_clocks(self) -> uint<N> {
+        let scl_low_clocks = self.data_hold_cycles +. self.low_for_ack_clocks();
+        let clocks_to_satisfy_clock_cycles = if self.scl_cycles >= scl_low_clocks {
+            self.scl_cycles -. scl_low_clocks
+        } else {
+            0
+        };
+        self.scl_high_cycles.max(clocks_to_satisfy_clock_cycles)
+    }
+
+    fn low_before_stop_clocks(self) -> uint<N> {
+        self.scl_low_cycles.max(self.data_setup_cycles)
+    }
+
+    fn repeated_start_clocks(self) -> uint<N> {
+        self.scl_low_cycles +. self.restart_setup_cycles +. self.start_hold_cycles +. self.data_hold_cycles
+    }
+
+    fn stop_clocks(self) -> uint<N> {
+        self.scl_low_cycles +. self.stop_setup_cycles +. self.after_stop_cycles
+    }
+}
+
+pub enum ReqByBit {
+    Start,
+    Restart,
+    Stop,
+    WriteBit { bit: bool },
+    ReadBit,
+}
+
+pub struct OutputByBit {
+    // If `true`, leave as input
+    // If `false`, drive low
+    sda: bool,
+    // If `true`, leave as input
+    // If `false`, drive low
+    scl: bool,
+    read_bit: Option<bool>,
+}
+
+enum StateByBit<#uint N> {
+    // After a STOP or FPGA rst
+    // Can transition to Start
+    IdleSclHigh,
+    // Handling a START request
+    // Can transition to IdleSclLow, WritingBit, or ReadingBit
+    Start {
+        // # of clocks that the start request was handled
+        // The 1st phase will have SCL high, duration: start_hold_cycles
+        // The 2nd phase will have SCL low, duration: data_hold_cycles
+        c_left: uint<N>,
+    },
+    // After a START or bit write or bit read
+    // Can transition to WritingBit, ReadingBit, Restart, or Stop
+    IdleSclLow {
+        // # of clocks scl was low
+        // # saturates at scl_cycles - scl_high_cycles
+        c: uint<N>,
+    },
+    // Handling a write bit request
+    // Can transition to IdleSclLow, WritingBit, ReadingBit, Restart, or Stop
+    WritingBit {
+        // # of clocks left for the request
+        // The 1st phase will have SCL low (duration: scl_cycles - scl_high_cycles)
+        // The 2nd phase will have SCL high (duration: scl_high_cycles)
+        // The 3rd phase will have SCL low (duration: data_hold_cycles)
+        c_left: uint<N>,
+    },
+    // Handling a read bit request
+    // Can transition to IdleSclLow, WritingBit, ReadingBit, Restart, or Stop
+    ReadingBit {
+        // # of clocks left for the request
+        // The 1st phase will have SCL low (duration: scl_cycles - scl_high_cycles)
+        // The 2nd phase will have SCL high (duration: scl_high_cycles)
+        //   - At scl_high_cycles / 2, SDA is sampled
+        c_left: uint<N>,
+    },
+    // Handling a START request
+    // Can transition to IdleSclHigh or Start
+    Stop {
+        // # of clocks left
+        // The 1st phase will have SDA low SCL low (duration: scl_low_cycles)
+        // The 2nd phase will have SDA low SCL high (duration: stop_setup_cycles)
+        // The 3rd phase will have SDA high SCL high (duration: after_stop_cycles)
+        c_left: uint<N>,
+    },
+    // Handling a repeated START request
+    Restart {
+        // # of clocks left
+        // The 1st phase will have SDA high SCL low (duration: scl_low_cycles)
+        // The 2nd phase will have SDA high SCL high (duration: restart_setup_cycles)
+        // The 3rd phase will have SDA low SCL high (duration: start_hold_cycles)
+        // The 4th phase will have SDA low SCL low (duration: data_hold_cycles)
+        c_left: uint<N>,
+    },
+}
+
+struct S<#uint N> {
+    sda: bool,
+    scl: bool,
+    req_ready: bool,
+    res: Option<bool>,
+    new_state: StateByBit<N>,
+}
+
+/// Always makes the SCL high part the shortest possible part of a SCL clock.
+/// When reading a bit, the return value will contain `Some` for exactly 1 clock cycle before or on the last clock cycle of the read bit request.
+entity i2c_controller_by_bit<#uint N>(
+    clk: clock,
+    rst: bool,
+    // If in output, don't care
+    sda: bool,
+    // If in output, don't care
+    scl: bool,
+    req: Rv<ReqByBit>,
+    config: Config<N>,
+) -> OutputByBit {
+    let Rv { _data: req, ready: req_ready } = req;
+    decl state;
+    let s = match (state, req) {
+        // Handle idle with no request
+        (StateByBit::IdleSclHigh, None) => S {
+            sda: true,
+            scl: true,
+            req_ready: false,
+            res: None,
+            new_state: StateByBit::IdleSclHigh,
+        },
+        (StateByBit::IdleSclLow { c }, None) => S {
+            sda: true,
+            scl: false,
+            req_ready: false,
+            res: None,
+            new_state: StateByBit::IdleSclLow {
+                c: if c == config.scl_cycles -. config.scl_high_cycles {
+                    c
+                } else {
+                    c +. 1
+                },
+            },
+        },
+        // Handle existing requests in progress
+        (StateByBit::Start { c_left }, _) => S {
+            sda: false,
+            scl: if c_left >= config.data_hold_cycles {
+                true
+            } else {
+                false
+            },
+            req_ready: c_left == 0,
+            res: None,
+            new_state: if c_left == 0 {
+                StateByBit::IdleSclLow { c: config.data_hold_cycles }
+            } else {
+                StateByBit::Start { c_left: c_left -. 1 }
+            },
+        },
+        (StateByBit::WritingBit { c_left }, Some(ReqByBit::WriteBit { bit })) => S {
+            sda: bit,
+            scl: if c_left >= config.data_hold_cycles +. config.scl_high_cycles {
+                false
+            } else if c_left >= config.data_hold_cycles {
+                true
+            } else {
+                false
+            },
+            req_ready: c_left == 0,
+            res: None,
+            new_state: if c_left == 0 {
+                StateByBit::IdleSclLow { c: config.data_hold_cycles }
+            } else {
+                StateByBit::WritingBit { c_left: c_left -. 1 }
+            },
+        },
+        (StateByBit::ReadingBit { c_left }, _) => S {
+            sda: true,
+            scl: if c_left >= config.scl_high_cycles {
+                true
+            } else {
+                false
+            },
+            req_ready: c_left == 0,
+            res: if c_left < config.scl_high_cycles && c_left == config.scl_high_cycles / 2 {
+                Some(sda)
+            } else {
+                None
+            },
+            new_state: if c_left == 0 {
+                StateByBit::IdleSclLow { c: 0 }
+            } else {
+                StateByBit::ReadingBit { c_left: c_left -. 1 }
+            },
+        },
+        (StateByBit::Stop { c_left }, _) => S{
+            sda: if c_left >= config.after_stop_cycles +. config.stop_setup_cycles {
+                false
+            } else if c_left >= config.after_stop_cycles {
+                false
+            } else {
+                true
+            },
+            scl: if c_left >= config.after_stop_cycles +. config.stop_setup_cycles {
+                false
+            } else if c_left >= config.after_stop_cycles {
+                true
+            } else {
+                true
+            },
+            req_ready: c_left == 0,
+            res: None,
+            new_state: if c_left == 0 {
+                StateByBit::IdleSclHigh
+            } else {
+                StateByBit::Stop { c_left: c_left -. 1 }
+            },
+        },
+        (StateByBit::Restart { c_left }, _) => {
+            let (sda, scl) = if c_left >= config.data_hold_cycles +. config.start_hold_cycles +. config.restart_setup_cycles {
+                (true, false)
+            } else if c_left >= config.data_hold_cycles +. config.start_hold_cycles {
+                (true, true)
+            } else if c_left >= config.data_hold_cycles {
+                (false, true)
+            } else {
+                (false, false)
+            };
+            S {
+                sda,
+                scl,
+                req_ready: c_left == 0,
+                res: None,
+                new_state: if c_left == 0 {
+                    StateByBit::IdleSclLow { c: config.data_hold_cycles }
+                } else {
+                    StateByBit::Restart { c_left: c_left -. 1 }
+                },
+            }
+        },
+        // Handle new requests when no existing request is in progress
+        (_, Some(ReqByBit::Start)) => S {
+            sda: false,
+            scl: true,
+            req_ready: false,
+            res: None,
+            new_state: StateByBit::Start {
+                c_left: config.start_hold_cycles +. config.data_hold_cycles -. 1
+            },
+        },
+        (_, Some(ReqByBit::Restart)) => S {
+            sda: true,
+            scl: true,
+            req_ready: false,
+            res: None,
+            new_state: StateByBit::Restart {
+                c_left: config.repeated_start_clocks() -. 1
+            }
+        },
+        (_, Some(ReqByBit::Stop)) => S {
+            sda: false,
+            scl: false,
+            req_ready: false,
+            res: None,
+            new_state: StateByBit::Stop {
+                c_left: config.stop_clocks() -. 1
+            },
+        },
+        (state, Some(ReqByBit::WriteBit { bit })) => S {
+            sda: bit,
+            scl: false,
+            req_ready: false,
+            res: None,
+            new_state: StateByBit::WritingBit {
+                c_left: {
+                    let max_sub = config.scl_cycles -. config.scl_high_cycles -. config.data_setup_cycles;
+                    let sub = match state {
+                        StateByBit::IdleSclLow { c } => if c > max_sub {
+                            max_sub
+                        } else {
+                            c
+                        },
+                        _ => 0,
+                    };
+                    config.scl_cycles +. config.data_hold_cycles -. 1 -. sub
+                },
+            },
+        },
+        (_, Some(ReqByBit::ReadBit)) => S {
+            sda: true,
+            scl: false,
+            req_ready: false,
+            res: None,
+            new_state: StateByBit::ReadingBit {
+                c_left: config.scl_cycles,
+            },
+        },
+        // Unreachable
+        (state, None) => S {
+            sda: true,
+            scl: true,
+            req_ready: false,
+            res: None,
+            new_state: state,
+        }
+    };
+    reg(clk) state reset(rst: StateByBit::IdleSclHigh) = s.new_state;
+
+    set req_ready = s.req_ready;
+
+    OutputByBit {
+        sda: s.sda,
+        scl: s.scl,
+        read_bit: s.res,
+    }
+}
+
+entity i2c_controller_by_bit_th(
+    clk: clock,
+    rst: bool,
+    // If in output, don't care
+    sda: bool,
+    // If in output, don't care
+    scl: bool,
+    req: Rv<ReqByBit>,
+    config: Config<7>,
+    // Additional output for visualisation
+    sda_out: inv bool,
+    scl_out: inv bool,
+    ready_out: inv bool,
+    read_bit_out: inv bool,
+    read_bit_out_is_some: inv bool,
+) -> OutputByBit {
+    let (ready, ready_inv) = port();
+    let output = inst i2c_controller_by_bit(clk, rst, sda, scl, Rv(req._data, ready_inv), config);
+    set sda_out = output.sda;
+    set scl_out = output.scl;
+    set read_bit_out = match output.read_bit {
+        Some(read_bit) => read_bit,
+        _ => false
+    };
+    set read_bit_out_is_some = output.read_bit.is_some();
+    set req.ready = ready;
+    set ready_out = ready;
+    output
+}
+
+enum Rw {
+    Read,
+    Write,
+}
+
+struct StartRequest {
+    rw: Rw,
+    addr: uint<7>,
+}
+
+impl StartRequest {
+    fn to_byte(self) -> uint<8> {
+        let rw_bit = match self.rw {
+            Rw::Read => true,
+            Rw::Write => false,
+        };
+        concat_arrays([rw_bit], self.addr.as_bits()).as_uint()
+    }
+}
+
+enum State<#uint N> {
+    // SDA: high
+    // SCL: high
+    // Next state: `StartConditionHold`
+    Idle {
+        // If we just stopped, we have to wait until we can start again
+        cooldown: uint<N>,
+    },
+    // SDA: low
+    // SCL: high
+    // Hold for `start_hold_cycles`
+    // Next state: `DataHold` with scl_low = true
+    StartConditionHold {
+        request: StartRequest,
+        clocks_remaining: uint<N>,
+    },
+    // SDA: prev value
+    // SCL: low
+    // Hold for `data_hold_cycles`
+    // Next state: `DataSetup` if more bits to send, otherwise `LowForAck`
+    DataHold {
+        sda_low: bool,
+        byte: uint<8>,
+        next_bit: Option<uint<3>>,
+        clocks_remaining: uint<N>,
+    },
+    // SDA: next value
+    // SCL: low
+    // Hold for `max(data_setup_cycles, scl_low_cycles - data_hold_cycles)`
+    // Next state: `DataHigh`
+    DataSetup {
+        byte: uint<8>,
+        bits_left: uint<3>,
+        clocks_remaining: uint<N>,
+    },
+    // SDA: current value
+    // SCL: high
+    // Hold for `max(scl_high_cycles,  scl_cycles - (data_hold_cycles + max(data_setup_cycles, scl_low_cycles - data_hold_cycles)))`
+    // Next state: `DataHold`
+    DataHigh {
+        byte: uint<8>,
+        bits_left: uint<3>,
+        clocks_remaining: uint<N>,
+    },
+    // SDA: not pulled low by controller
+    // SCL: low
+    // Hold for `max(scl_low_cycles - data_hold_cycles, 0)`
+    // Next state: `HighForAck`
+    LowForAck {
+        clocks_remaining: uint<N>,
+    },
+    // SDA: should be pulled low by the target, can be sampled immediately when setting this
+    // SCL: high
+    // Hold for `max(scl_high_cycles, scl_clock_cycles - (data_hold_cycles + max(scl_low_cycle - data_hold_cycles, 0)))`
+    // Next state: `DataHold` with sda_low = false if writing a byte or `LowBeforeStop` if no more bytes or no ACK received
+    HighForAck {
+        received_ack: bool,
+        clocks_remaining: uint<N>,
+    },
+    // SDA: low
+    // SCL: low
+    // Hold for `max(scl_low_cycles, data_setup_cycles)`
+    // Next state: `StopSetup`
+    LowBeforeStop {
+        clocks_remaining: uint<N>,
+    },
+    // SDA: low
+    // SCL: high
+    // Hold for `stop_setup_cycles`
+    // Next state: `Idle` with cooldown of `after_stop_cycles`
+    StopSetup {
+        clocks_remaining: uint<N>,
+    },
+}
+
+/// Currently only supports 7-bit addresses.
+///
+/// Valid patterns:
+/// None -> Some(StartWrite) -> 1 or more Some(WriteByte) -> None or Some(Start*) (repeated START sent automatically).
+/// None -> Some(StartRead) -> 1 or more Some(ReadByte) -> None or Some(Start*) (repeated START sent automatically).
+pub enum Request {
+    StartWrite { addr: uint<7> },
+    StartRead { addr: uint<7> },
+    WriteByte { byte: uint<8> },
+    ReadByte,
+}
+
+pub enum status {
+    // Didn't receive ACK. This is an error. You cannot write any bytes now.
+    Nack,
+    Ack,
+    ReceivedByte { byte: uint<8> }
+}
+
+struct V<#uint N> {
+    next_state: State<N>,
+    sda_low: bool,
+    scl_low: bool,
+    ready: bool,
+    status: Option<status>,
+}
+
+/// Automatically sends START when a new request is provided and it's idle.
+/// Automatically sends repeated START when a new request is provided right after a transaction is completed.
+/// Automatically sends STOP when a transaction is over.
+///
+/// This means that if you have a request and `ready == true`, you must set the request to the next
+/// thing you want to do on the next clock cycle. Otherwise, it will automatically STOP.
+///
+/// Technically we could just pause SCL and not auto-stop. This is not currently implemented.
+pub entity i2c_controller<#uint N>(
+    clk: clock,
+    rst: bool,
+    scl_low: bool,
+    sda_low: bool,
+    request: Rv<Request>,
+    config: Config<N>,
+) -> Output {
+    let Rv { _data: request, ready } = request;
+
+    decl state;
+    let v = match state {
+        State::Idle { cooldown } => V {
+            sda_low: false,
+            scl_low: false,
+            ready: cooldown == 0,
+            status: None,
+            next_state: match (cooldown, request) {
+                (0, Some(Request::StartWrite { addr })) => State::StartConditionHold {
+                    request: StartRequest {
+                        rw: Rw::Write,
+                        addr,
+                    },
+                    clocks_remaining: config.start_hold_cycles -. 1,
+                },
+                (0, Some(Request::StartRead { addr })) => State::StartConditionHold {
+                    request: StartRequest {
+                        rw: Rw::Read,
+                        addr,
+                    },
+                    clocks_remaining: config.start_hold_cycles -. 1,
+                },
+                _ => State::Idle {
+                    cooldown: if cooldown == 0 {
+                        0
+                    } else {
+                        cooldown -. 1
+                    },
+                },
+            },
+        },
+        State::StartConditionHold { request, clocks_remaining } => V {
+            sda_low: true,
+            scl_low: false,
+            ready: false,
+            status: None,
+            next_state: if clocks_remaining == 0 {
+                State::DataHold {
+                    sda_low: true,
+                    byte: request.to_byte(),
+                    next_bit: Some(7),
+                    clocks_remaining: config.data_hold_clocks() -. 1,
+                }
+            } else {
+                State::StartConditionHold {
+                    request,
+                    clocks_remaining: clocks_remaining -. 1
+                }
+            },
+        },
+        State::DataHold { sda_low, byte, next_bit, clocks_remaining } => V {
+            sda_low,
+            scl_low: true,
+            ready: false,
+            status: None,
+            next_state: if clocks_remaining == 0 {
+                match next_bit {
+                    None => State::LowForAck {
+                        clocks_remaining: config.low_for_ack_clocks() -. 1,
+                    },
+                    Some(next_bit) => State::DataSetup {
+                        byte,
+                        bits_left: next_bit,
+                        clocks_remaining: config.data_setup_cycles.max(config.scl_low_cycles -. config.data_hold_cycles),
+                    }
+                }
+            } else {
+                State::DataHold {
+                    sda_low,
+                    byte,
+                    next_bit,
+                    clocks_remaining: clocks_remaining -. 1,
+                }
+            },
+        },
+        State::DataSetup { byte, bits_left, clocks_remaining } => V {
+            sda_low: !byte.as_bits()[bits_left],
+            scl_low: true,
+            ready: false,
+            status: None,
+            next_state: if clocks_remaining == 0 {
+                State::DataHigh {
+                    byte,
+                    bits_left,
+                    clocks_remaining: config.scl_high_cycles.max(
+                        config.scl_cycles -.
+                        (
+                            config.data_hold_cycles +.
+                            config.data_setup_cycles.max(config.scl_low_cycles -. config.data_hold_cycles)
+                        )
+                    ),
+                }
+            } else {
+                State::DataSetup {
+                    byte,
+                    bits_left,
+                    clocks_remaining: clocks_remaining -. 1,
+                }
+            },
+        },
+        State::DataHigh { byte, bits_left, clocks_remaining } => V {
+            sda_low: !byte.as_bits()[bits_left],
+            scl_low: false,
+            ready: false,
+            status: None,
+            next_state: if clocks_remaining == 0 {
+                State::DataHold {
+                    sda_low: !byte.as_bits()[bits_left],
+                    byte,
+                    next_bit: if bits_left == 0 {
+                        None
+                    } else {
+                        Some(bits_left -. 1)
+                    },
+                    clocks_remaining: config.data_hold_cycles -. 1,
+                }
+            } else  {
+                State::DataHigh {
+                    byte,
+                    bits_left,
+                    clocks_remaining: clocks_remaining -. 1,
+                }
+            },
+        },
+        State::LowForAck { clocks_remaining } => V {
+            sda_low: false,
+            scl_low: true,
+            ready: false,
+            status: None,
+            next_state: if clocks_remaining == 0 {
+                State::HighForAck {
+                    received_ack: sda_low,
+                    clocks_remaining: config.high_for_ack_clocks() -. 1,
+                }
+            } else {
+                State::LowForAck {
+                    clocks_remaining: clocks_remaining -. 1,
+                }
+            },
+        },
+        State::HighForAck {
+            received_ack,
+            clocks_remaining
+        } => if clocks_remaining == 0 {
+            V {
+                sda_low: false,
+                scl_low: false,
+                ready: true,
+                status: None,
+                next_state: match request {
+                    Some(Request::StartWrite { addr }) => {
+                        // Send repeated START
+                        // TODO: actually do it
+                        State::Idle { cooldown: 0 }
+                    },
+                    Some(Request::StartRead { addr }) => {
+                        // Send repeated START
+                        // TODO: actually do it
+                        State::Idle { cooldown: 0 }
+                    },
+                    Some(Request::WriteByte { byte }) => {
+                        // We assume the caller started a write transaction and received ACK
+                        // Send the byte
+                        State::DataHold {
+                            sda_low: false,
+                            byte,
+                            next_bit: Some(7),
+                            clocks_remaining: config.data_hold_clocks() -. 1,
+                        }
+                    },
+                    Some(Request::ReadByte) => {
+                        // We assume the caller started a read transaction and received  ACK
+                        // Read the byte
+                        // TODO: actually do it
+                        State::Idle { cooldown: 0 }
+                    },
+                    None => {
+                        // Send STOP
+                        State::LowBeforeStop {
+                            clocks_remaining: config.low_before_stop_clocks() -. 1,
+                        }
+                    },
+                }
+            }
+        } else {
+            V {
+                sda_low: false,
+                scl_low: false,
+                ready: false,
+                // Don't send a NACK error until after this phase
+                status: Some(if received_ack {
+                    status::Ack
+                } else {
+                    status::Nack
+                }),
+                next_state: State::HighForAck {
+                    received_ack,
+                    clocks_remaining: clocks_remaining -. 1,
+                }
+            }
+        },
+        State::LowBeforeStop { clocks_remaining } => V {
+            sda_low: true,
+            scl_low: true,
+            ready: false,
+            status: None,
+            next_state: if clocks_remaining == 0 {
+                State::StopSetup {
+                    clocks_remaining: config.stop_setup_cycles -. 1
+                }
+            } else {
+                State::LowBeforeStop {
+                    clocks_remaining: clocks_remaining -. 1,
+                }
+            },
+        },
+        State::StopSetup { clocks_remaining } => V {
+            sda_low: true,
+            scl_low: false,
+            ready: false,
+            status:  None,
+            next_state: if clocks_remaining == 0 {
+                State::Idle {
+                    cooldown: config.after_stop_cycles,
+                }
+            } else {
+                State::StopSetup {
+                    clocks_remaining: clocks_remaining -. 1,
+                }
+            },
+        },
+    };
+    reg(clk) state initial(State::Idle { cooldown: 0 }) reset(rst: State::Idle { cooldown: 0 }) = v.next_state;
+
+    set ready = v.ready;
+
+    Output {
+        scl_low: v.scl_low,
+        sda_low: v.sda_low,
+        status: v.status,
+    }
+}
+
+// Expects a 10 MHz clock.
+// 10 MHz is enough to cleanly test 400 kHz
+entity i2c_controller_th(
+    clk: clock,
+    rst: bool,
+    scl_low: bool,
+    sda_low: bool,
+    request: Rv<Request>,
+    config: Config<5>,
+    #[no_mangle]
+    sda: inv bool,
+    #[no_mangle]
+    scl: inv bool,
+) -> Output {
+    let output = inst i2c_controller(clk, rst, scl_low, sda_low, request, config);
+    set sda = !output.sda_low;
+    set scl = !output.scl_low;
+    output
+}

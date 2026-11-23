@@ -1,0 +1,6 @@
+name = "i2c"
+
+description = "I2C protocol library"
+
+[libraries]
+ready_valid.git = "https://codeberg.org/spade-lang/ready_valid.git"
