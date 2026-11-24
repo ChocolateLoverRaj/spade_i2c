@@ -31,9 +31,19 @@
                 cargoHash = "sha256-IxEdK1bnoFXZYnTxmGI71h0WyrZ+Bu7twkUVLO7mIUo=";
               }
             ))
+            (surfer.overrideAttrs (
+              finalAttrs: previousAttrs: {
+                src = pkgs.fetchFromGitLab {
+                  owner = "surfer-project";
+                  repo = "surfer";
+                  rev = "c2d17a6457bba6204143f3c6f7fd3c58cf893837";
+                  hash = "sha256-Hf9nDK/6taP8AFXDOzVwpl7WlBxG6pjyaqUOA2te2nQ=";
+                };
+                cargoHash = "sha256-6dOoPMxOW2+vlTPXQME7OMeXLfWGyi7H3PY77x22TWY=";
+              }
+            ))
             uv
             iverilog
-            surfer
           ];
         };
       }

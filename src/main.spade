@@ -164,6 +164,115 @@ struct S<#uint N> {
     new_state: StateByBit<N>,
 }
 
+fn compute_s_start<#uint N>(config: Config<N>, c_left: uint<N>) -> S<N> {
+    S {
+        sda: false,
+        scl: if c_left >= config.data_hold_cycles {
+            true
+        } else {
+            false
+        },
+        req_ready: c_left == 0,
+        res: None,
+        new_state: if c_left == 0 {
+            StateByBit::IdleSclLow { c: config.data_hold_cycles }
+        } else {
+            StateByBit::Start { c_left: c_left -. 1 }
+        },
+    }
+}
+
+fn compute_s_writing_bit<#uint N>(config: Config<N>, bit: bool, c_left: uint<N>) -> S<N> {
+    S {
+        sda: bit,
+        scl: if c_left >= config.data_hold_cycles +. config.scl_high_cycles {
+            false
+        } else if c_left >= config.data_hold_cycles {
+            true
+        } else {
+            false
+        },
+        req_ready: c_left == 0,
+        res: None,
+        new_state: if c_left == 0 {
+            StateByBit::IdleSclLow { c: config.data_hold_cycles }
+        } else {
+            StateByBit::WritingBit { c_left: c_left -. 1 }
+        },
+    }
+}
+
+fn compute_s_reading_bit<#uint N>(config: Config<N>, sda: bool, c_left: uint<N>) -> S<N> {
+    S {
+        sda: true,
+        scl: if c_left >= config.scl_high_cycles {
+            false
+        } else {
+            true
+        },
+        req_ready: c_left == 0,
+        res: if c_left < config.scl_high_cycles && c_left == config.scl_high_cycles / 2 {
+            Some(sda)
+        } else {
+            None
+        },
+        new_state: if c_left == 0 {
+            StateByBit::IdleSclLow { c: 0 }
+        } else {
+            StateByBit::ReadingBit { c_left: c_left -. 1 }
+        },
+    }
+}
+
+fn compute_s_stop<#uint N>(config: Config<N>, c_left: uint<N>) -> S<N> {
+    S {
+        sda: if c_left >= config.after_stop_cycles +. config.stop_setup_cycles {
+            false
+        } else if c_left >= config.after_stop_cycles {
+            false
+        } else {
+            true
+        },
+        scl: if c_left >= config.after_stop_cycles +. config.stop_setup_cycles {
+            false
+        } else if c_left >= config.after_stop_cycles {
+            true
+        } else {
+            true
+        },
+        req_ready: c_left == 0,
+        res: None,
+        new_state: if c_left == 0 {
+            StateByBit::IdleSclHigh
+        } else {
+            StateByBit::Stop { c_left: c_left -. 1 }
+        },
+    }
+}
+
+fn compute_s_restart<#uint N>(config: Config<N>, c_left: uint<N>) -> S<N> {
+    let (sda, scl) = if c_left >= config.data_hold_cycles +. config.start_hold_cycles +. config.restart_setup_cycles {
+        (true, false)
+    } else if c_left >= config.data_hold_cycles +. config.start_hold_cycles {
+        (true, true)
+    } else if c_left >= config.data_hold_cycles {
+        (false, true)
+    } else {
+        (false, false)
+    };
+    S {
+        sda,
+        scl,
+        req_ready: c_left == 0,
+        res: None,
+        new_state: if c_left == 0 {
+            StateByBit::IdleSclLow { c: config.data_hold_cycles }
+        } else {
+            StateByBit::Restart { c_left: c_left -. 1 }
+        },
+    }
+}
+
 /// Always makes the SCL high part the shortest possible part of a SCL clock.
 /// When reading a bit, the return value will contain `Some` for exactly 1 clock cycle before or on the last clock cycle of the read bit request.
 entity i2c_controller_by_bit<#uint N>(
@@ -201,112 +310,13 @@ entity i2c_controller_by_bit<#uint N>(
             },
         },
         // Handle existing requests in progress
-        (StateByBit::Start { c_left }, _) => S {
-            sda: false,
-            scl: if c_left >= config.data_hold_cycles {
-                true
-            } else {
-                false
-            },
-            req_ready: c_left == 0,
-            res: None,
-            new_state: if c_left == 0 {
-                StateByBit::IdleSclLow { c: config.data_hold_cycles }
-            } else {
-                StateByBit::Start { c_left: c_left -. 1 }
-            },
-        },
-        (StateByBit::WritingBit { c_left }, Some(ReqByBit::WriteBit { bit })) => S {
-            sda: bit,
-            scl: if c_left >= config.data_hold_cycles +. config.scl_high_cycles {
-                false
-            } else if c_left >= config.data_hold_cycles {
-                true
-            } else {
-                false
-            },
-            req_ready: c_left == 0,
-            res: None,
-            new_state: if c_left == 0 {
-                StateByBit::IdleSclLow { c: config.data_hold_cycles }
-            } else {
-                StateByBit::WritingBit { c_left: c_left -. 1 }
-            },
-        },
-        (StateByBit::ReadingBit { c_left }, _) => S {
-            sda: true,
-            scl: if c_left >= config.scl_high_cycles {
-                true
-            } else {
-                false
-            },
-            req_ready: c_left == 0,
-            res: if c_left < config.scl_high_cycles && c_left == config.scl_high_cycles / 2 {
-                Some(sda)
-            } else {
-                None
-            },
-            new_state: if c_left == 0 {
-                StateByBit::IdleSclLow { c: 0 }
-            } else {
-                StateByBit::ReadingBit { c_left: c_left -. 1 }
-            },
-        },
-        (StateByBit::Stop { c_left }, _) => S{
-            sda: if c_left >= config.after_stop_cycles +. config.stop_setup_cycles {
-                false
-            } else if c_left >= config.after_stop_cycles {
-                false
-            } else {
-                true
-            },
-            scl: if c_left >= config.after_stop_cycles +. config.stop_setup_cycles {
-                false
-            } else if c_left >= config.after_stop_cycles {
-                true
-            } else {
-                true
-            },
-            req_ready: c_left == 0,
-            res: None,
-            new_state: if c_left == 0 {
-                StateByBit::IdleSclHigh
-            } else {
-                StateByBit::Stop { c_left: c_left -. 1 }
-            },
-        },
-        (StateByBit::Restart { c_left }, _) => {
-            let (sda, scl) = if c_left >= config.data_hold_cycles +. config.start_hold_cycles +. config.restart_setup_cycles {
-                (true, false)
-            } else if c_left >= config.data_hold_cycles +. config.start_hold_cycles {
-                (true, true)
-            } else if c_left >= config.data_hold_cycles {
-                (false, true)
-            } else {
-                (false, false)
-            };
-            S {
-                sda,
-                scl,
-                req_ready: c_left == 0,
-                res: None,
-                new_state: if c_left == 0 {
-                    StateByBit::IdleSclLow { c: config.data_hold_cycles }
-                } else {
-                    StateByBit::Restart { c_left: c_left -. 1 }
-                },
-            }
-        },
+        (StateByBit::Start { c_left }, _) => compute_s_start(config, c_left),
+        (StateByBit::WritingBit { c_left }, Some(ReqByBit::WriteBit { bit })) => compute_s_writing_bit(config, bit, c_left),
+        (StateByBit::ReadingBit { c_left }, _) => compute_s_reading_bit(config, sda, c_left),
+        (StateByBit::Stop { c_left }, _) => compute_s_stop(config, c_left),
+        (StateByBit::Restart { c_left }, _) => compute_s_restart(config, c_left),
         // Handle new requests when no existing request is in progress
-        (_, Some(ReqByBit::Start)) => S {
-            sda: false,
-            scl: true,
-            req_ready: false,
-            res: None,
-            new_state: StateByBit::Start {
-                c_left: config.start_hold_cycles +. config.data_hold_cycles -. 1
-            },
-        },
+        (_, Some(ReqByBit::Start)) => compute_s_start(config, config.start_hold_cycles +. config.data_hold_cycles -. 1),
         (_, Some(ReqByBit::Restart)) => S {
             sda: true,
             scl: true,
@@ -316,44 +326,32 @@ entity i2c_controller_by_bit<#uint N>(
                 c_left: config.repeated_start_clocks() -. 1
             }
         },
-        (_, Some(ReqByBit::Stop)) => S {
-            sda: false,
-            scl: false,
-            req_ready: false,
-            res: None,
-            new_state: StateByBit::Stop {
-                c_left: config.stop_clocks() -. 1
-            },
-        },
-        (state, Some(ReqByBit::WriteBit { bit })) => S {
-            sda: bit,
-            scl: false,
-            req_ready: false,
-            res: None,
-            new_state: StateByBit::WritingBit {
-                c_left: {
-                    let max_sub = config.scl_cycles -. config.scl_high_cycles -. config.data_setup_cycles;
-                    let sub = match state {
-                        StateByBit::IdleSclLow { c } => if c > max_sub {
-                            max_sub
-                        } else {
-                            c
-                        },
-                        _ => 0,
-                    };
-                    config.scl_cycles +. config.data_hold_cycles -. 1 -. sub
+        (_, Some(ReqByBit::Stop)) => compute_s_stop(config, {
+            let sub = match state {
+                StateByBit::IdleSclLow { c } => c,
+                _ => 0,
+            };
+            config.stop_clocks() -. 1 -. sub
+        }),
+        (state, Some(ReqByBit::WriteBit { bit })) => compute_s_writing_bit(config, bit, {
+            let max_sub = config.scl_cycles -. config.scl_high_cycles -. config.data_setup_cycles;
+            let sub = match state {
+                StateByBit::IdleSclLow { c } => if c > max_sub {
+                    max_sub
+                } else {
+                    c
                 },
-            },
-        },
-        (_, Some(ReqByBit::ReadBit)) => S {
-            sda: true,
-            scl: false,
-            req_ready: false,
-            res: None,
-            new_state: StateByBit::ReadingBit {
-                c_left: config.scl_cycles,
-            },
-        },
+                _ => 0,
+            };
+            config.scl_cycles +. config.data_hold_cycles -. 1 -. sub
+        }),
+        (_, Some(ReqByBit::ReadBit)) => compute_s_reading_bit(config, sda, {
+            let sub = match state {
+                StateByBit::IdleSclLow { c } => c,
+                _ => 0,
+            };
+            config.scl_cycles -. 1 -. sub
+        }),
         // Unreachable
         (state, None) => S {
             sda: true,
@@ -384,23 +382,23 @@ entity i2c_controller_by_bit_th(
     req: Rv<ReqByBit>,
     config: Config<7>,
     // Additional output for visualisation
-    sda_out: inv bool,
-    scl_out: inv bool,
-    ready_out: inv bool,
-    read_bit_out: inv bool,
-    read_bit_out_is_some: inv bool,
+    // sda_out: inv bool,
+    // scl_out: inv bool,
+    // ready_out: inv bool,
+    // read_bit_out: inv bool,
+    // read_bit_out_is_some: inv bool,
 ) -> OutputByBit {
     let (ready, ready_inv) = port();
     let output = inst i2c_controller_by_bit(clk, rst, sda, scl, Rv(req._data, ready_inv), config);
-    set sda_out = output.sda;
-    set scl_out = output.scl;
-    set read_bit_out = match output.read_bit {
-        Some(read_bit) => read_bit,
-        _ => false
-    };
-    set read_bit_out_is_some = output.read_bit.is_some();
+    // set sda_out = output.sda;
+    // set scl_out = output.scl;
+    // set read_bit_out = match output.read_bit {
+    //     Some(read_bit) => read_bit,
+    //     _ => false
+    // };
+    // set read_bit_out_is_some = output.read_bit.is_some();
     set req.ready = ready;
-    set ready_out = ready;
+    // set ready_out = ready;
     output
 }
 
