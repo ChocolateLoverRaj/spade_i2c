@@ -317,15 +317,18 @@ entity i2c_controller_by_bit<#uint N>(
         (StateByBit::Restart { c_left }, _) => compute_s_restart(config, c_left),
         // Handle new requests when no existing request is in progress
         (_, Some(ReqByBit::Start)) => compute_s_start(config, config.start_hold_cycles +. config.data_hold_cycles -. 1),
-        (_, Some(ReqByBit::Restart)) => S {
-            sda: true,
-            scl: true,
-            req_ready: false,
-            res: None,
-            new_state: StateByBit::Restart {
-                c_left: config.repeated_start_clocks() -. 1
-            }
-        },
+        (_, Some(ReqByBit::Restart)) => compute_s_restart(config, {
+            let max_sub = config.scl_cycles -. config.scl_high_cycles -. config.data_setup_cycles;
+            let sub = match state {
+                StateByBit::IdleSclLow { c } => if c > max_sub {
+                    max_sub
+                } else {
+                    c
+                },
+                _ => 0,
+            };
+            config.scl_low_cycles +. config.restart_setup_cycles +. config.start_hold_cycles +. config.data_hold_cycles -. 1 -. sub
+        }),
         (_, Some(ReqByBit::Stop)) => compute_s_stop(config, {
             let sub = match state {
                 StateByBit::IdleSclLow { c } => c,
@@ -381,24 +384,8 @@ entity i2c_controller_by_bit_th(
     scl: bool,
     req: Rv<ReqByBit>,
     config: Config<7>,
-    // Additional output for visualisation
-    // sda_out: inv bool,
-    // scl_out: inv bool,
-    // ready_out: inv bool,
-    // read_bit_out: inv bool,
-    // read_bit_out_is_some: inv bool,
 ) -> OutputByBit {
-    let (ready, ready_inv) = port();
-    let output = inst i2c_controller_by_bit(clk, rst, sda, scl, Rv(req._data, ready_inv), config);
-    // set sda_out = output.sda;
-    // set scl_out = output.scl;
-    // set read_bit_out = match output.read_bit {
-    //     Some(read_bit) => read_bit,
-    //     _ => false
-    // };
-    // set read_bit_out_is_some = output.read_bit.is_some();
-    set req.ready = ready;
-    // set ready_out = ready;
+    let output = inst i2c_controller_by_bit(clk, rst, sda, scl, req, config);
     output
 }
 
