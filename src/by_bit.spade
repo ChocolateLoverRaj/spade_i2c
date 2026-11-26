@@ -1,0 +1,310 @@
+use super::Config;
+use ready_valid::Rv;
+
+pub(lib) enum Req {
+    Start,
+    Restart,
+    Stop,
+    WriteBit { bit: bool },
+    ReadBit,
+}
+
+pub(lib) struct Output {
+    // If `true`, leave as input
+    // If `false`, drive low
+    sda: bool,
+    // If `true`, leave as input
+    // If `false`, drive low
+    scl: bool,
+    read_bit: Option<bool>,
+}
+
+enum State<#uint N> {
+    // After a STOP or FPGA rst
+    // Can transition to Start
+    IdleSclHigh,
+    // Handling a START request
+    // Can transition to IdleSclLow, WritingBit, or ReadingBit
+    Start {
+        // # of clocks that the start request was handled
+        // The 1st phase will have SCL high, duration: start_hold_cycles
+        // The 2nd phase will have SCL low, duration: data_hold_cycles
+        c_left: uint<N>,
+    },
+    // After a START or bit write or bit read
+    // Can transition to WritingBit, ReadingBit, Restart, or Stop
+    IdleSclLow {
+        // # of clocks scl was low
+        // # saturates at scl_cycles - scl_high_cycles
+        c: uint<N>,
+    },
+    // Handling a write bit request
+    // Can transition to IdleSclLow, WritingBit, ReadingBit, Restart, or Stop
+    WritingBit {
+        // # of clocks left for the request
+        // The 1st phase will have SCL low (duration: scl_cycles - scl_high_cycles)
+        // The 2nd phase will have SCL high (duration: scl_high_cycles)
+        // The 3rd phase will have SCL low (duration: data_hold_cycles)
+        c_left: uint<N>,
+    },
+    // Handling a read bit request
+    // Can transition to IdleSclLow, WritingBit, ReadingBit, Restart, or Stop
+    ReadingBit {
+        // # of clocks left for the request
+        // The 1st phase will have SCL low (duration: scl_cycles - scl_high_cycles)
+        // The 2nd phase will have SCL high (duration: scl_high_cycles)
+        //   - At scl_high_cycles / 2, SDA is sampled
+        c_left: uint<N>,
+    },
+    // Handling a START request
+    // Can transition to IdleSclHigh or Start
+    Stop {
+        // # of clocks left
+        // The 1st phase will have SDA low SCL low (duration: scl_low_cycles)
+        // The 2nd phase will have SDA low SCL high (duration: stop_setup_cycles)
+        // The 3rd phase will have SDA high SCL high (duration: after_stop_cycles)
+        c_left: uint<N>,
+    },
+    // Handling a repeated START request
+    Restart {
+        // # of clocks left
+        // The 1st phase will have SDA high SCL low (duration: scl_low_cycles)
+        // The 2nd phase will have SDA high SCL high (duration: restart_setup_cycles)
+        // The 3rd phase will have SDA low SCL high (duration: start_hold_cycles)
+        // The 4th phase will have SDA low SCL low (duration: data_hold_cycles)
+        c_left: uint<N>,
+    },
+}
+
+struct S<#uint N> {
+    sda: bool,
+    scl: bool,
+    ready: bool,
+    res: Option<bool>,
+    new_state: State<N>,
+}
+
+fn compute_s_start<#uint N>(config: Config<N>, c_left: uint<N>) -> S<N> {
+    S {
+        sda: false,
+        scl: if c_left >= config.data_hold_cycles {
+            true
+        } else {
+            false
+        },
+        ready: c_left == 0,
+        res: None,
+        new_state: if c_left == 0 {
+            State::IdleSclLow { c: config.data_hold_cycles }
+        } else {
+            State::Start { c_left: c_left -. 1 }
+        },
+    }
+}
+
+fn compute_s_writing_bit<#uint N>(config: Config<N>, bit: bool, c_left: uint<N>) -> S<N> {
+    S {
+        sda: bit,
+        scl: if c_left >= config.data_hold_cycles +. config.scl_high_cycles {
+            false
+        } else if c_left >= config.data_hold_cycles {
+            true
+        } else {
+            false
+        },
+        ready: c_left == 0,
+        res: None,
+        new_state: if c_left == 0 {
+            State::IdleSclLow { c: config.data_hold_cycles }
+        } else {
+            State::WritingBit { c_left: c_left -. 1 }
+        },
+    }
+}
+
+fn compute_s_reading_bit<#uint N>(config: Config<N>, sda: bool, c_left: uint<N>) -> S<N> {
+    S {
+        sda: true,
+        scl: if c_left >= config.scl_high_cycles {
+            false
+        } else {
+            true
+        },
+        ready: c_left == 0,
+        res: if c_left < config.scl_high_cycles && c_left == config.scl_high_cycles / 2 {
+            Some(sda)
+        } else {
+            None
+        },
+        new_state: if c_left == 0 {
+            State::IdleSclLow { c: 0 }
+        } else {
+            State::ReadingBit { c_left: c_left -. 1 }
+        },
+    }
+}
+
+fn compute_s_stop<#uint N>(config: Config<N>, c_left: uint<N>) -> S<N> {
+    S {
+        sda: if c_left >= config.after_stop_cycles +. config.stop_setup_cycles {
+            false
+        } else if c_left >= config.after_stop_cycles {
+            false
+        } else {
+            true
+        },
+        scl: if c_left >= config.after_stop_cycles +. config.stop_setup_cycles {
+            false
+        } else if c_left >= config.after_stop_cycles {
+            true
+        } else {
+            true
+        },
+        ready: c_left == 0,
+        res: None,
+        new_state: if c_left == 0 {
+            State::IdleSclHigh
+        } else {
+            State::Stop { c_left: c_left -. 1 }
+        },
+    }
+}
+
+fn compute_s_restart<#uint N>(config: Config<N>, c_left: uint<N>) -> S<N> {
+    let (sda, scl) = if c_left >= config.data_hold_cycles +. config.start_hold_cycles +. config.restart_setup_cycles {
+        (true, false)
+    } else if c_left >= config.data_hold_cycles +. config.start_hold_cycles {
+        (true, true)
+    } else if c_left >= config.data_hold_cycles {
+        (false, true)
+    } else {
+        (false, false)
+    };
+    S {
+        sda,
+        scl,
+        ready: c_left == 0,
+        res: None,
+        new_state: if c_left == 0 {
+            State::IdleSclLow { c: config.data_hold_cycles }
+        } else {
+            State::Restart { c_left: c_left -. 1 }
+        },
+    }
+}
+
+/// Always makes the SCL high part the shortest possible part of a SCL clock.
+/// When reading a bit, the return value will contain `Some` for exactly 1 clock cycle before or on the last clock cycle of the read bit request.
+pub(lib) entity i2c_controller_by_bit<#uint N>(
+    clk: clock,
+    rst: bool,
+    // If in output, don't care
+    sda: bool,
+    // If in output, don't care
+    scl: bool,
+    req: Rv<Req>,
+    config: Config<N>,
+) -> Output {
+    let Rv { _data: req, ready } = req;
+    decl state;
+    let s = match (state, req) {
+        // Handle idle with no request
+        (State::IdleSclHigh, None) => S {
+            sda: true,
+            scl: true,
+            ready: false,
+            res: None,
+            new_state: State::IdleSclHigh,
+        },
+        (State::IdleSclLow { c }, None) => S {
+            sda: true,
+            scl: false,
+            ready: false,
+            res: None,
+            new_state: State::IdleSclLow {
+                c: if c == config.scl_cycles -. config.scl_high_cycles {
+                    c
+                } else {
+                    c +. 1
+                },
+            },
+        },
+        // Handle existing requests in progress
+        (State::Start { c_left }, _) => compute_s_start(config, c_left),
+        (State::WritingBit { c_left }, Some(Req::WriteBit { bit })) => compute_s_writing_bit(config, bit, c_left),
+        (State::ReadingBit { c_left }, _) => compute_s_reading_bit(config, sda, c_left),
+        (State::Stop { c_left }, _) => compute_s_stop(config, c_left),
+        (State::Restart { c_left }, _) => compute_s_restart(config, c_left),
+        // Handle new requests when no existing request is in progress
+        (_, Some(Req::Start)) => compute_s_start(config, config.start_hold_cycles +. config.data_hold_cycles -. 1),
+        (_, Some(Req::Restart)) => compute_s_restart(config, {
+            let max_sub = config.scl_cycles -. config.scl_high_cycles -. config.data_setup_cycles;
+            let sub = match state {
+                State::IdleSclLow { c } => if c > max_sub {
+                    max_sub
+                } else {
+                    c
+                },
+                _ => 0,
+            };
+            config.scl_low_cycles +. config.restart_setup_cycles +. config.start_hold_cycles +. config.data_hold_cycles -. 1 -. sub
+        }),
+        (_, Some(Req::Stop)) => compute_s_stop(config, {
+            let sub = match state {
+                State::IdleSclLow { c } => c,
+                _ => 0,
+            };
+            config.scl_low_cycles +. config.stop_setup_cycles +. config.after_stop_cycles -. 1 -. sub
+        }),
+        (state, Some(Req::WriteBit { bit })) => compute_s_writing_bit(config, bit, {
+            let max_sub = config.scl_cycles -. config.scl_high_cycles -. config.data_setup_cycles;
+            let sub = match state {
+                State::IdleSclLow { c } => if c > max_sub {
+                    max_sub
+                } else {
+                    c
+                },
+                _ => 0,
+            };
+            config.scl_cycles +. config.data_hold_cycles -. 1 -. sub
+        }),
+        (_, Some(Req::ReadBit)) => compute_s_reading_bit(config, sda, {
+            let sub = match state {
+                State::IdleSclLow { c } => c,
+                _ => 0,
+            };
+            config.scl_cycles -. 1 -. sub
+        }),
+        // Unreachable
+        (state, None) => S {
+            sda: true,
+            scl: true,
+            ready: false,
+            res: None,
+            new_state: state,
+        }
+    };
+    reg(clk) state reset(rst: State::IdleSclHigh) = s.new_state;
+
+    set ready = s.ready;
+
+    Output {
+        sda: s.sda,
+        scl: s.scl,
+        read_bit: s.res,
+    }
+}
+
+entity i2c_controller_by_bit_th(
+    clk: clock,
+    rst: bool,
+    // If in output, don't care
+    sda: bool,
+    // If in output, don't care
+    scl: bool,
+    req: Rv<Req>,
+    config: Config<7>,
+) -> Output {
+    let output = inst i2c_controller_by_bit(clk, rst, sda, scl, req, config);
+    output
+}

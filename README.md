@@ -1,12 +1,12 @@
 # `i2c`
 A library for using the I2C protocol with the [Spade Hardware Description Language](https://spade-lang.org/).
 
-## Features
+## Implemented Features
 - [x] Controller Mode
-- [ ] Repeated Start
+- [x] Repeated Start
+- [x] 10-bit addresses
 - [ ] Share I2C Bus with other controllers
 - [ ] Fast-mode Plus
-- [ ] 10-bit addresses
 
 ## Usage
 TODO

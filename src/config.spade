@@ -1,0 +1,36 @@
+pub struct Config<#uint N> {
+    // The fields are ordered based on the order of phases
+
+    // The minimum start condition hold time, in clock cycles
+    // "hold time (repeated) START condition"
+    start_hold_cycles: uint<N>,
+    // The minimum number of cycles that data should be held after SCL changes to low
+    // "data hold time"
+    data_hold_cycles: uint<N>,
+    // The minimum number of clock cycles between setting SDA to the value and setting SCL high.
+    // "data set-up time"
+    data_setup_cycles: uint<N>,
+    // This might surprise you: one SCL clock technically cannot be 50% high 50% low.
+    // It actually needs to be low for >50% of the min clock duration.
+    // This value is the minimum number of cycles that SCL needs to be held low.
+    scl_low_cycles: uint<N>,
+    // The minimum number of cycles that SCL must be held high
+    scl_high_cycles: uint<N>,
+    // The minimum number of clock cyles for 1 SCL clock cycle
+    // "SCL clock frequency" (converted into period)
+    scl_cycles: uint<N>,
+    // The minimum number of clock cycles that SDA must be held low before it can be set high when sending STOP.
+    // "set-up time for STOP condition"
+    stop_setup_cycles: uint<N>,
+    // The minimum number of clock cycles between finishing sending STOP and starting sending START
+    after_stop_cycles: uint<N>,
+    // The min # of cycles that SDA must be held high before making SDA low to signal a repeated START
+    restart_setup_cycles: uint<N>,
+
+    // Not configurable currently:
+    // The number of cycles that the target is allowed to wait between SCL going low and pulling SDA low to signal ACK.
+    // In practice this should always be <scl_low_cycles, so the controller can sample SDA at the same time that it sets SCL high.
+    // Maybe there is a device which actually allows itself time >scl_low_cycles, and we need to adjust our logic.
+    // But until such a device is known to exist we will assume sampling at the same time that SCL is set high is okay.
+    // ack_cycles: uint<N>
+}
