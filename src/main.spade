@@ -330,7 +330,7 @@ entity i2c_controller_th(
     // If in output, don't care
     scl: bool,
     req: Rv<Req>,
-    config: Config<7>,
+    config: Config<5>,
 ) -> Output {
     inst i2c_controller(clk, rst, sda, scl, req, config)
 }

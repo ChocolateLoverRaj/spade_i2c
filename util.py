@@ -52,7 +52,7 @@ config_400_khz: Config = {
     "scl_cycles": 25,
     "stop_setup_cycles": 6,
     "after_stop_cycles": 13,
-    "restart_setup_cycles": 13,
+    "restart_setup_cycles": 6,
     "data_valid_ack_time": 9,
 }
 async def reset(dut):

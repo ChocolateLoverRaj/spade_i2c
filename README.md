@@ -1,5 +1,5 @@
 # `i2c`
-A library for using the I2C protocol with the [Spade Hardware Description Language](https://spade-lang.org/).
+A library for using the I2C protocol with the [Spade hardware description language](https://spade-lang.org/).
 
 ## Implemented Features
 - [x] Controller Mode
@@ -9,13 +9,59 @@ A library for using the I2C protocol with the [Spade Hardware Description Langua
 - [ ] Fast-mode Plus
 
 ## Usage
-TODO
+Import the following:
+```
+use i2c::{i2c_controller, Config, Req, Output, Status, AddrRw, Addr, Rw};
+```
+In your top module, you will need to use `inout<bool>` for the SCL and SDA pins. Like this:
+```
+#[no_mangle(all)]
+entity top(
+    // 27 MHz
+    clk: clock,
+    rst: bool,
+    scl: inout<bool>,
+    sda: inout<bool>,
+)
+```
+And then convert them into a `(Option<bool>, inv Option<bool>)`:
+```
+let (scl, scl_inv) = scl.read_write();
+let (sda, sda_inv) = sda.read_write();
+```
+Then define a `Config`. See the docs for `Config` for the requirements for `N`.
+
+The entity takes `bool` for `sda` and `scl`, but the inputs we got from `read_write` are `Option<bool>`. The entity doesn't care about the values when it is pulling them low, so just do
+```
+let sda = sda == Some(true);
+let scl = scl == Some(true);
+```
+The entity uses `ready_valid` for what command it should do, so create a port for the ready variable:
+```
+let (ready, ready_inv) = port();
+```
+Then, based on your application, define a `req: Option<Req>` variable, which will probably be derived from state that comes from `reg(clk)`.
+
+Then, create the entity:
+```
+let output = inst i2c_controller(
+    clk,
+    rst,
+    sda,
+    scl,
+    Rv(req, ready_inv),
+    config,
+);
+```
+Set the SDA and SCL pins according to the output:
+```
+set scl_inv = if output.scl { None } else { Some(false) };
+set sda_inv = if output.sda { None } else { Some(false) };
+```
+Use `output.status` and `ready` to advance your state as commands complete. You always have to start with the `Start` command, then `ReadByte` or `WriteByte`. Then you can `Restart` or `Stop`. Note that `output.status` indicates if the command was successful or not. `Start`, `WriteByte`, and `Restart` are successful if the status is `Status::Ack` and unsuccessful if the status is `Status::Nack`. `ReadByte` outputs the byte as `Status::ReadByte`. `Stop` doesn't output anything. 
 
 ## Examples
-TODO
-
-## Tests
-TODO
+- TODO
 
 ## I2C protocol
 This is from the perspective of the controller
@@ -76,20 +122,3 @@ SCL inv: LHL LH LHHL LHL
 `a`: set SDA to high before setting SCL high. The time between `a` and `b` must be at least "data setup time". . Again, a good generic I2C duration for this is 1/2 of a clock duration.
 
 `c`: the controller changes SDA from high to low while SCL is high, indicating a repeated start condition. The time between `b` and `c` must be at least the "start condition setup time", which for the SSD1309 is 0.6 us. For a generic value, we can use 1/2 of a clock duration.
-
-## Clock Perfection
-### START
-On the same clock as receiving a request to START, we can pull SDA low. We must hold it for start condition hold time.
-
-Then we need to pull SCL low too and hold it for data hold time. On the last clock of the hold time, we can set `ready = true`
-
-### Writing a bit
-At this point, even without a request, we can hold SDA as don't care and SCL low for "clock cycle time" - "HIGH period of SCL clock" - "data set-up time" without losing any time. I will call this low-maxxing, since we are maximizing the SCL low phase of the i2c clock signal and minimizing the SCL high phase. Low-maxxing allows us to write a bit as late as possible.
-
-Once we reach the point where we need to start the data setup, the bit must be ready. If it's not ready, we can keep holding SCL low, but it won't be at the max transfer speed. Once we get the bit, we just set SDA to the bit and SCL low for "data set-up time". Then we set SCL high for "HIGH period of SCL clock" or more to satisfy the total period of SCL clock. Then we set SCL low for "data hold time". On the last clock of the data holding, we set `ready == true`
-
-### Reading ACK
-This time we will do high-maxxing. It allows us to read a bit as early as possible. Technically, the controller should be able to read ACK before even SCL high for the 9th bit, so we don't need to high-maxx. While SCL is low, we just need to wait for "data valid acknowledge time". Then on the clock after that, we sample SDA to get ACK/NACK. In total, we hold SCL low for "LOW period of SCL clock" - "data setup time"
-
-### Reading a bit
-Continue leaving SCL low for the minimum time that SCL must be low.

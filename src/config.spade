@@ -1,3 +1,4 @@
+/// `N` must be large enough to a `uint` which can store `scl_low_cycles + restart_setup_cycles + start_hold_cycles + data_hold_cycles`
 pub struct Config<#uint N> {
     // The fields are ordered based on the order of phases
 
